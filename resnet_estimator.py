@@ -44,7 +44,6 @@ def cnn_model_fn(features, labels, mode, params):
 
     # Configure the Training Op (for TRAIN mode)
     if mode == tf.estimator.ModeKeys.TRAIN:
-        # Horovod: scale learning rate by the number of workers.
         optimizer = AdamaxOptimizer
         global_step = tf.train.get_or_create_global_step()
         learning_rate = tf.train.piecewise_constant(global_step, params['boundaries'], params['values'])  
@@ -64,11 +63,10 @@ def cnn_model_fn(features, labels, mode, params):
                 global_step=global_step)
         return tf.estimator.EstimatorSpec(mode=mode, loss=loss, train_op=train_op)
 
-    # Add evaluation metrics (for EVAL mode)
-    
     # Horovod: calculate loss from all ranks
     loss = hvd.allreduce(loss)
     
+    # Add evaluation metrics (for EVAL mode)
     if params['test']:
         eval_metric_ops = {
             "test_accuracy": (hvd.allreduce(accuracy[0]), accuracy[1])} # Horovod: allreduce just accuracy value, not the update_op
@@ -88,12 +86,12 @@ def main(argv):
     PAYLOAD = '0.4'
 
     train_interval = 100
-    eval_interval = 3000
+    eval_interval = 5000
     save_interval = 100
     train_batch_size = 64
     max_iter = 500000//(train_batch_size//32)
-    eval_batch_size = 40
-    num_of_threads = 5
+    eval_batch_size = 50
+    num_of_threads = 10
     
     warm_start_checkpoint = None
     #warm_start_checkpoint = LOG_DIR + 'model.ckpt-323'
@@ -138,8 +136,12 @@ def main(argv):
     max_iter = max_iter//num_of_workers
     eval_interval = eval_interval//num_of_workers
     boundaries = [(400000//(train_batch_size//32))//num_of_workers]
+    params = {}
+    params['boundaries'] = boundaries
     values = [0.001, 0.0001]
     values = [val*(train_batch_size//32)*num_of_workers for val in values]
+    params['values'] = values
+    params['test'] = test
             
     CoverValPath = DB_FOLDER + 'Cover_VAL/'
     StegoValPath = DB_FOLDER + ALGORITHM + '/' + PAYLOAD + '/Stego_' + ALGORITHM + '_' + PAYLOAD + '_VAL/'
@@ -159,11 +161,13 @@ def main(argv):
         model_dir = LOG_DIR if hvd.rank() == 0 else None
     else: # if testing or predicting on multiple workers, load all of them
         model_dir = LOG_DIR
+        
+    
 
     # Create the Estimator
     resnet_classifier = tf.estimator.Estimator(
         model_fn=cnn_model_fn, model_dir=model_dir,
-        params={'boundaries': boundaries, 'values': values, 'test': test},
+        params=params,
         config=tf.estimator.RunConfig(save_summary_steps=save_interval,
                                       save_checkpoints_steps=eval_interval,
                                       session_config=config,
@@ -201,8 +205,8 @@ def main(argv):
         # Do whatever with predictions
         # Predictions is a generator now
         # Following line prints testing accuracy (if run on single GPU)
-        test_ds_size = glob(
-        print(np.sum(np.equal([p['classes'] for p in predictions], [0,1]*5000))/10000.)
+        test_ds_size = len(glob(CoverTstPath +'/*'))
+        print(np.sum(np.equal([p['classes'] for p in predictions], [0,1]*test_ds_size))/np.float32(test_ds_size*2))
         sys.exit()
     if test:
         test_results = resnet_classifier.evaluate(input_fn=partial(input_fn,
@@ -212,7 +216,7 @@ def main(argv):
                                                   hooks=[bcast_hook])
         print(test_results)
         sys.exit()
-
+            
     # Train the model
     for i in range(start,max_iter,eval_interval):
         
